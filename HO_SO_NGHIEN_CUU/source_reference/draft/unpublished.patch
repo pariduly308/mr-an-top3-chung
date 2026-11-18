@@ -1,0 +1,114 @@
+diff --git a/scripts/build.mjs b/scripts/build.mjs
+index d807452..ecf527b 100644
+--- a/scripts/build.mjs
++++ b/scripts/build.mjs
+@@ -1,5 +1,6 @@
+ import fs from 'node:fs';
++import crypto from 'node:crypto';
+ const read=p=>fs.readFileSync(p,'utf8');
+ fs.mkdirSync('dist/server',{recursive:true});
+ const workerSource=read('worker/analysis.mjs').replaceAll('export ', '')+'\nonmessage=e=>postMessage(backtest(e.data.history,e.data.digits));';
+-fs.writeFileSync('dist/server/index.js','const analysisWorkerSource='+JSON.stringify(workerSource)+';\n'+read('worker/analysis.mjs').replaceAll('export ', '')+'\n'+read('worker/tracking.mjs')+'\n'+read('worker/service.mjs')+'\nexport default createService('+JSON.stringify(read('worker/page.html').replace('/*ANALYSIS*/',()=>read('worker/analysis.mjs').replaceAll('export ', '')).replace('/*UI*/',()=>read('worker/ui.js')).replace('/*CENTRAL*/',()=> 'const centralDraws='+read('worker/central-data.json')+';\nconst centralScores='+read('worker/central-summary.json')+';\n'+read('worker/central.js')))+','+read('worker/seed.json')+','+read('worker/evaluation.json')+');');
++fs.writeFileSync('dist/server/index.js','const analysisWorkerSource='+JSON.stringify(workerSource)+';\n'+read('worker/analysis.mjs').replaceAll('export ', '')+'\n'+read('worker/tracking.mjs')+'\nconst centralSeed='+read('worker/central-data.json')+';\nconst centralFormulaHash='+JSON.stringify(crypto.createHash('sha256').update(read('worker/analysis.mjs')).digest('hex'))+';\n'+read('worker/central-service.mjs')+'\n'+read('worker/service.mjs')+'\nexport default createService('+JSON.stringify(read('worker/page.html').replace('/*ANALYSIS*/',()=>read('worker/analysis.mjs').replaceAll('export ', '')).replace('/*UI*/',()=>read('worker/ui.js')).replace('/*CENTRAL*/',()=> 'let centralDraws='+read('worker/central-data.json')+';\nconst centralScores='+read('worker/central-summary.json')+';\n'+read('worker/central.js')))+','+read('worker/seed.json')+','+read('worker/evaluation.json')+');');
+diff --git a/worker/central.js b/worker/central.js
+index a410db9..8671a7b 100644
+--- a/worker/central.js
++++ b/worker/central.js
+@@ -12,7 +12,9 @@
+   for (const [key, label] of Object.entries(methods)) method.add(new Option(label,key));
+   for (const value of ['2021','2022','2023','2024','2025','2026']) year.add(new Option(value,value));
+   date.value = new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Ho_Chi_Minh'}).format();
++  let locked=[];
+   function renderCentral() {
++    renderLocked();
+     top.replaceChildren();
+     if (!date.value || !date.validity.valid) {
+       top.textContent = 'Chọn ngày hợp lệ để xem Top 3.';
+@@ -47,6 +49,41 @@
+     table.innerHTML = '<table><thead><tr><th>Công thức</th><th>1 năm</th><th>3 năm</th><th>5 năm</th></tr></thead><tbody>'+
+       Object.entries(methods).map(([key,label]) => '<tr><th scope="row">'+label+'</th>'+[1,3,5].map(window=>'<td>'+cell(key,window)+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
+   }
++
++  const live = document.createElement('div');
++  const refresh = document.createElement('button');
++  const status = document.createElement('p');
++  refresh.textContent = 'Cập nhật miền Trung và khóa bộ hôm nay';
++  const lockedTable = document.createElement('div');
++  lockedTable.style.overflow = 'auto';
++  live.append(refresh,status,lockedTable);
++  document.getElementById('central').append(live);
++  function renderLocked() {
++    const selected=locked.filter(r=>r.station===station.value);
++    const summary=[1,3,5].map(window=>{
++      const done=selected.filter(r=>r.complete).map(r=>r.records.find(v=>v.years===window&&v.digits===Number(digits.value)&&v.method===method.value)).filter(Boolean);
++      return '<tr><td>'+window+' năm</td><td>'+done.filter(r=>r.distinct>0).length+'/'+done.length+'</td><td>'+[0,1,2,3].map(n=>n+' số '+done.filter(r=>r.distinct===n).length+' kỳ').join(' · ')+'</td></tr>';
++    }).join('');
++    lockedTable.innerHTML='<h3>Bộ đã khóa trước 17h · '+methods[method.value]+'</h3><p>Cùng đài, cùng kỳ, cùng Top 3. Tính số khớp khác nhau 0–3. Kỳ có ít nhất một số khớp được tính đạt.</p><table><tr><th>Cửa sổ</th><th>Kỳ đạt / đã chấm</th><th>Phân bố kết quả</th></tr>'+summary+'</table>'+
++    (selected.length?'<table><tr><th>Ngày / giờ chốt</th><th>Cửa sổ</th><th>Top 3</th><th>Số khớp</th></tr>'+selected.flatMap(lock=>lock.records.filter(r=>r.digits===Number(digits.value)&&r.method===method.value).map(r=>'<tr><td>'+lock.date+'<br>'+new Date(lock.createdAt).toLocaleTimeString('vi-VN',{timeZone:'Asia/Ho_Chi_Minh'})+'</td><td>'+r.years+' năm</td><td>'+r.top3.join(' · ')+'</td><td>'+(r.matches?r.matches.join(' · ')||'0':'Chờ kết quả')+'</td></tr>')).join('')+'</table>':'<p>Chưa có bộ khóa cho đài này. Mở app hoặc cập nhật trước 17h ngày quay, với kỳ gần nhất đủ kết quả, để lưu ba cửa sổ. Kỳ chưa có bản khóa được để trống.</p>');
++  }
++  async function refreshCentral() {
++    refresh.disabled=true;status.textContent='Đang cập nhật và kiểm tra bộ khóa…';
++    try {
++      const result=await fetch('/api/central/update',{method:'POST'});
++      if(!result.ok)throw Error('Cập nhật HTTP '+result.status);
++      const update=await result.json();
++      const responses=await Promise.all([fetch('/api/central/data'),fetch('/api/central/tracking')]);
++      if(responses.some(r=>!r.ok))throw Error('Chưa đọc được dữ liệu sau cập nhật');
++      [centralDraws,locked]=await Promise.all(responses.map(r=>r.json()));
++      status.textContent='Dữ liệu đến '+(update.latestDate||'chưa xác nhận')+'. '+(update.errors.length?update.errors.join(' · '):'Đã kiểm tra bộ khóa hôm nay.')+' Bảng hồi cứu bên trên chốt giai đoạn 10/11/2021–12/11/2026.';
++      renderCentral();
++    } catch(error) {status.textContent='Cập nhật chưa hoàn tất. '+error.message;}
++    finally {refresh.disabled=false;}
++  }
++  refresh.onclick=refreshCentral;
++
+   for (const element of [station,digits,date,years,method,year]) element.addEventListener('change',renderCentral);
+   renderCentral();
++  refreshCentral();
+ }
+diff --git a/worker/page.html b/worker/page.html
+index 5581b53..cf58ce7 100644
+--- a/worker/page.html
++++ b/worker/page.html
+@@ -1,6 +1,6 @@
+ <!doctype html><html lang="vi"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mr Ân • Top 3 chung</title><style>body{margin:0;background:#f4f6fa;color:#152539;font:16px system-ui}main{max-width:1100px;margin:auto;padding:24px}header{background:#102c43;color:white;padding:30px;border-radius:24px}h1{font-size:32px}small{color:#627588}header small{color:#99dbd0}input,select,button{font:inherit;padding:12px;border:1px solid #c9d6df;border-radius:10px;background:white;margin:5px}button{cursor:pointer;color:#075d55}section,.card{background:white;padding:22px;border-radius:18px;margin:16px 0;box-shadow:0 4px 24px #1231}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}.balls{font-size:30px;font-weight:800;color:#008879}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:12px 6px;border-bottom:1px solid #eee}.note{font-size:14px;color:#586a7b}a{color:#00756c}#detail,#evaluation,#tracking{overflow:auto}button:disabled{opacity:.6;cursor:wait}#sync,#missing{overflow-wrap:anywhere}</style><main><header><small>MR ÂN / TOP 3 CHUNG · SITE RIÊNG TƯ</small><h1>Một bộ 3 · Hai đài miền Nam</h1><p>Miền Nam: Top 3 chung · XSMB: giữ công thức cũ</p><p><a style="color:#99dbd0" href="#central">Miền Trung · Nghiên cứu</a></p></header><section><label>Ngày cần xem <input id="day" type="date"></label><p class="note">Xếp hạng chỉ dùng các kỳ trước ngày đang xem. Các số đứng đầu theo tần suất lịch sử, chưa chứng minh có xác suất cao hơn ở kỳ tới.</p><label>Chế độ <select id="digits"><option value="2">2 số cuối · 00–99</option><option value="3">3 số cuối · 000–999</option></select></label><label>Miền Nam <select id="method"><option value="frequency">Tần suất toàn kỳ</option><option value="recent10">10 kỳ gần nhất</option><option value="recent20">20 kỳ gần nhất</option><option value="recent50">50 kỳ gần nhất</option><option value="gap">Hay ra và đang vắng</option><option value="repeat" selected>Lặp nhiều ở kỳ trước</option></select></label><label>XSMB <select id="northMethod"><option value="frequency">Tần suất toàn kỳ</option><option value="recent10">10 kỳ gần nhất</option><option value="recent20">20 kỳ gần nhất</option><option value="recent50">50 kỳ gần nhất</option><option value="gap">Hay ra và đang vắng</option><option value="repeat">Lặp nhiều ở kỳ trước</option></select></label><label>Khoảng thống kê <select id="years"><option value="1">1 năm</option><option value="3">3 năm</option><option value="5" selected>5 năm</option></select></label><button id="update">Cập nhật ngay</button><p id="sync" class="note"></p><p id="missing" class="note"></p><div id="status">Đang tải dữ liệu…</div></section><section><b>Bản thử nghiệm độc lập</b><p>Đạt khi ít nhất một số trong bộ 3 ra ở bất kỳ đài nào của cặp. Không cần cùng ra cả hai. Miền Nam mặc định “Lặp nhiều ở kỳ trước”; có thể so sáu cách. XSMB có lựa chọn riêng, công thức giữ nguyên. Chưa chứng minh cách mới tốt hơn ổn định.</p></section><div id="cards" class="grid"></div><section><h2>Kiểm tra số của anh</h2><select id="station"></select><input id="number" inputmode="numeric" maxlength="2" placeholder="00–99" size="5"><button id="check">Kiểm tra</button><div id="detail"></div><div id="numberHistory" style="overflow:auto"></div></section><section><h2>So sánh sáu cách tính</h2><p>Mỗi kỳ chỉ dùng lịch sử trước kỳ đó để xếp hạng. Đạt khi ít nhất một trong ba số xuất hiện. Với 2 số cuối, mốc Top 3 ngẫu nhiên khoảng 66,6% cho cặp miền Nam và 56,1% miền Bắc. Với 3 số cuối, mốc tương ứng khoảng 9,7% và 6,7%.</p><div id="evaluation"></div><h3>Kiểm chứng ước lượng phần trăm</h3><div id="audit" style="overflow:auto"></div></section><section><h2>Dự báo đã lưu trước giờ quay</h2><p>Top 3 được khóa lần đầu khi lưu trước 16h miền Nam và 18h miền Bắc, dùng toàn bộ dữ liệu có trước kỳ. Đối chiếu tự động khi có đủ giải. Chỉ lưu cho hôm nay trước giờ khóa khi lịch sử đã đủ. Không tạo dự báo bù cho kỳ đã quay. Ngày nghỉ hoặc thay đổi lịch có thể cần kiểm tra nguồn.</p><div id="tracking"></div></section><section><h2>Nghiên cứu được lưu riêng</h2><p>Đánh giá theo dữ liệu mới: Top 3 chung miền Nam và giả thuyết số miền Nam chiều lặp lại ở XSMB tối. Các kết quả được ghi vào nhật ký nghiên cứu, không tự thay đổi thuật toán trên Site.</p><p>Phiên bản đang dùng: pair-six-v1 cho miền Nam; six-methods-v1 cho XSMB. Mọi thay đổi sau này cần anh đồng ý.</p></section><section><h2>Dữ liệu và cách đọc</h2><p>Xếp hạng theo tỷ lệ kỳ có mặt trong khoảng 1, 3 hoặc 5 năm anh chọn. Tổng lần ra vẫn tính đủ các lần lặp trong một kỳ. Miền Nam đếm kỳ của đúng cặp đài, chỉ nhận kỳ đủ cả hai bảng. Một số có mặt ở một hoặc cả hai đài đều tính một kỳ có mặt. XSMB đếm theo kỳ riêng.</p><p>Chế độ 3 số cuối chỉ lấy kết quả dài ít nhất 3 chữ số. Giữ nguyên số 0 đầu, ví dụ 007. Điểm “hay ra và đang vắng” là số kỳ có mặt nhân số kỳ vắng, giới hạn ở 20 kỳ. Điểm này là giả thuyết để kiểm tra. Điểm “lặp nhiều” ưu tiên số có nhiều lần ở kỳ trước, rồi tần suất khi bằng điểm.</p><p>Mốc tham chiếu lý thuyết cho một số xuất hiện ít nhất một lần là 30,4% với 36 kết quả của cặp miền Nam và 23,8% với 27 kết quả, dưới giả định các lượt quay độc lập và đồng đều. Tần suất quá khứ chưa phải xác suất dự báo.</p><p id="coverage"></p><p class="note">Nguồn <a href="https://www.minhngoc.net.vn/" target="_blank" rel="noreferrer">Minh Ngọc</a>. Dữ liệu ban đầu: 10/11/2021–11/11/2026. Khi mở Site, app kiểm tra các kỳ gần đây; có nút cập nhật ngay. Tác vụ riêng kiểm tra dữ liệu và lưu nhật ký nghiên cứu. Dữ liệu được lưu riêng trên Site này.</p></section><section id="central">
+ <h2>Miền Trung · Nghiên cứu</h2>
+-<p class="note">Minh Ngọc · 8.534 bảng của 14 đài, từ 10/11/2016 đến 12/11/2026. Xếp hạng theo từng đài. Các tỷ lệ là kết quả hồi cứu; chưa xác nhận lợi thế trên kỳ mới. Có 343 vị trí theo lịch tham chiếu chưa phân loại.</p>
++<p class="note">Minh Ngọc · Dữ liệu khởi tạo 8.534 bảng của 14 đài từ 10/11/2016 đến 12/11/2026, cập nhật kỳ gần đây khi mở app. Xếp hạng theo từng đài. Các tỷ lệ là kết quả hồi cứu; chưa xác nhận lợi thế trên kỳ mới. Có 343 vị trí theo lịch tham chiếu chưa phân loại.</p>
+ <label>Đài <select id="centralStation"></select></label>
+ <label>Đuôi <select id="centralDigits"><option value="2">2 số</option><option value="3">3 số</option></select></label>
+ <label>Ngày xem <input type="date" id="centralDate" min="2016-11-11"></label>
+diff --git a/worker/service.mjs b/worker/service.mjs
+index e09189b..5b16cfb 100644
+--- a/worker/service.mjs
++++ b/worker/service.mjs
+@@ -3,9 +3,9 @@ export function parse(html,region){
+  for(const block of html.split('<div class="box_kqxs">').slice(1)){
+   const match=block.match(new RegExp('class="title"[\\s\\S]*?/('+region+')/(\\d{2})-(\\d{2})-(\\d{4})\\.html'));if(!match)continue;
+   const date=`${match[4]}-${match[3]}-${match[2]}`,dt=new Date(date+'T12:00:00Z');if(!Number.isFinite(+dt)||dt.toISOString().slice(0,10)!==date)continue;
+-  const tables=region==='mien-nam'?[...block.matchAll(/<table[^>]*class="rightcl"[^>]*>([\s\S]*?)<\/table>/g)].map(m=>m[1]):[block];
++  const tables=region!=='mien-bac'?[...block.matchAll(/<table[^>]*class="rightcl"[^>]*>([\s\S]*?)<\/table>/g)].map(m=>m[1]):[block];
+   for(const table of tables){
+-   const station=region==='mien-bac'?'XSMB':table.match(/class="tinh"[^>]*>\s*<a[^>]*>(.*?)<\/a>/s)?.[1].trim();if(!station||(station!=='XSMB'&&!stationDays[dt.getUTCDay()].includes(station)))continue;
++   const station=region==='mien-bac'?'XSMB':table.match(/class="tinh"[^>]*>\s*<a[^>]*>(.*?)<\/a>/s)?.[1].trim();if(!station||(station!=='XSMB'&&!(region==='mien-trung'?centralDays:stationDays)[dt.getUTCDay()].includes(station)))continue;
+    const prizes={};let bad=false;
+    for(const cell of table.matchAll(/<td class="(giai[1-8]|giaidb)"[^>]*>([\s\S]*?)<\/td>/g)){
+     if(!shapes[cell[1]]||prizes[cell[1]]){bad=true;break;}
+@@ -24,6 +24,9 @@ export function createService(page,seed,evaluation){return {async fetch(request,
+  if(request.method==='POST'&&request.headers.get('Origin')&&request.headers.get('Origin')!==new URL(request.url).origin)return new Response('Forbidden',{status:403});
+  if(path==='/')return new Response(page,{headers:{'Content-Type':'text/html;charset=utf-8','Cache-Control':'no-cache'}});
+  if(path==='/analysis-worker.js')return new Response(analysisWorkerSource,{headers:{'Content-Type':'text/javascript;charset=utf-8','Cache-Control':'no-cache'}});
++ if(path==='/api/central/data')return json(await centralRows(env.BUCKET));
++ if(path==='/api/central/tracking')return json(await centralTracking(env.BUCKET,await centralRows(env.BUCKET)));
++ if(path==='/api/central/update'&&request.method==='POST')return json(await updateCentral(env.BUCKET));
+  if(path==='/evaluation.json')return json(evaluation);
+  if(path==='/api/status'){const obj=await env.BUCKET.get('status.json');return json(obj?await obj.json():{lastCheck:null});}
+  if(path==='/data.json')return json(await allDraws(env.BUCKET,seed));
+@@ -49,6 +52,7 @@ export function createService(page,seed,evaluation){return {async fetch(request,
+   }
+   try{status.forecastsSaved=await captureForecasts(env.BUCKET,await allDraws(env.BUCKET,seed));}catch(e){status.errors.push('Lưu dự báo: '+e.message);}
+   const current=await allDraws(env.BUCKET,seed);status.pending=stationsOn(today).filter(s=>!(s==='XSMB'&&isNorthHoliday(today))&&!current.some(r=>r.station===s&&r.date===today));status.message=status.pending.length?'Đang chờ bảng đủ giải của ngày hôm nay.':'Đã đủ bảng của ngày hôm nay.';
++  status.central=await updateCentral(env.BUCKET,now);
+   await env.BUCKET.put('status.json',JSON.stringify(status));return json(status);
+  }
+  return new Response('Not found',{status:404});
